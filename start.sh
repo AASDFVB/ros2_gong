@@ -4,9 +4,10 @@
 #   ./start.sh              ros2_control 模式（真实达妙 CAN 硬件）+ RViz   ← 默认
 #   ./start.sh --no-rviz    不启动 RViz
 #   ./start.sh --rebuild    先 colcon build
-#   ./start.sh --rate 60    更新频率
 #
 # 启动前会自动配置 CAN 并清掉旧实例。
+# 更新频率在 src/robotarm/config/ros2_controllers.yaml（update_rate，默认 200 Hz），
+# 没有命令行开关，也不接受 launch 参数覆盖。
 
 set -u
 WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,14 +15,12 @@ IFACE=can0
 BITRATE=1000000
 REBUILD=0
 RVIZ=true
-RATE=200
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --rebuild) REBUILD=1; shift ;;
     --no-rviz) RVIZ=false; shift ;;
-    --rate)    RATE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "未知参数: $1"; exit 1 ;;
   esac
 done

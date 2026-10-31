@@ -1,6 +1,7 @@
 # ros2_control 控制器配置（第一步：mock 硬件）
 controller_manager:
   ros__parameters:
+    # 更新频率的唯一入口：改这里，start.sh / launch 都不覆盖
     update_rate: 200          # Hz，read/write 循环频率
 
     joint_state_broadcaster:

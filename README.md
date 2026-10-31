@@ -73,6 +73,8 @@ colcon build --symlink-install
 | `--no-rviz` | 不启动 RViz |
 | `--rebuild` | 先 `colcon build --symlink-install` |
 
+更新频率由 `src/robotarm/config/ros2_controllers.yaml` 里的 `update_rate` 决定（默认 200 Hz），没有命令行开关；`--symlink-install` 下改完重新 launch 即可，不用重新编译。
+
 `can0` 未配置且当前用户没有免密 sudo 时，脚本会打印需要手动执行的三行命令后退出。
 
 ## Launch 文件
