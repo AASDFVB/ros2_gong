@@ -1,5 +1,9 @@
  npx @deepseek-ai/dsh web
-
+ 
+ 保存版本
+cd ~/Desktop/ros2_gong
+git add -A && git commit -m "改了什么"
+git push
 2.随后打开终端启动pcan指令如下
 sudo modprobe -r peak_usb
 sudo modprobe peak_usb
