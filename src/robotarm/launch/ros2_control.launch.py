@@ -1,7 +1,10 @@
-"""ros2_control 链路启动（第一步：mock 硬件，不接 CAN）。
+"""ros2_control 链路启动（真机：达妙 DM4310 / can0）。
 
     robot_state_publisher + ros2_control_node + joint_state_broadcaster
     + joint_trajectory_controller + rviz2
+
+    硬件由 URDF 的 <ros2_control> 段声明（robotarm_hardware/DmSystemHardware），
+    控制器参数来自 config/ros2_controllers.yaml，update_rate 也只在那里改。
 
 用法:
     ros2 launch robotarm ros2_control.launch.py

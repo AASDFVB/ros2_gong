@@ -1,4 +1,4 @@
-# ros2_control 控制器配置（第一步：mock 硬件）
+# ros2_control 控制器配置（真机：达妙 DM4310 / can0；硬件插件在 URDF 的 <ros2_control> 段）
 controller_manager:
   ros__parameters:
     # 更新频率的唯一入口：改这里，start.sh / launch 都不覆盖
