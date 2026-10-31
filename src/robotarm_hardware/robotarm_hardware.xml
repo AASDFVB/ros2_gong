@@ -1,0 +1,7 @@
+<library path="robotarm_hardware">
+  <class name="robotarm_hardware/DmSystemHardware"
+         type="robotarm_hardware::DmSystemHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>达妙 DM4310 六轴 CAN 硬件接口</description>
+  </class>
+</library>

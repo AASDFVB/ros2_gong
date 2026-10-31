@@ -1,0 +1,140 @@
+ npx @deepseek-ai/dsh web
+
+2.随后打开终端启动pcan指令如下
+sudo modprobe -r peak_usb
+sudo modprobe peak_usb
+ip link show can0
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set up can0
+ip link show can0
+
+3。输出查看
+candump can0
+
+4.测试can通信是否正常控制帧
+cansend can0 001#FFFFFFFFFFFFFFFC
+cansend can0 002#FFFFFFFFFFFFFFFC
+cansend can0 003#FFFFFFFFFFFFFFFC
+cansend can0 004#FFFFFFFFFFFFFFFC
+cansend can0 005#FFFFFFFFFFFFFFFC
+python3 tools/live_feedback.py   是查看达妙反馈侦
+查看rviz接真机
+cd ~/Desktop/ros2_gong
+./start.sh
+cd ~/Desktop/ros2_gong && python3 tools/gravity_comp.py --send
+
+
+每 10 ms 执行一轮：读取 6 个关节角，用 Pinocchio 计算重力矩，再换算到电机侧，最后打包成 MIT 帧发送
+can0 ──读寄存器 RID 0x51──> enc[6]
+                              │  ① q = dir·enc + offset
+                              ▼
+                            q[6]  ──② Pinocchio RNEA──> g(q)[6]
+                                                        │  ③ τ_motor = dir·g·gain·scale·ramp
+                                                        ▼
+                                                    MIT 帧 ──> can0 ──> 电机内部 PD
+                                                    
+① 编码器角 → 关节角（第 248 行）
+python
+
+return np.array([dirs[j] * enc[j] + offs[j] for j in JOINTS])
+
+其中 dir 和 offset 来自标定得到的 joint_offsets.yaml。dir 是 ±1，用来解决编码器转向和 URDF 轴向相反的问题，例如你这台臂是 [+1, −1, +1, +1, +1, +1]。
+
+② 关节角 → 重力矩（第 253 行）
+python
+
+g = pin.computeGeneralizedGravity(model, data, q)
+
+它在数学上相当于 RNEA，动力学逆解在 q̇=0, q̈=0 时得到的特例：
+代码块
+
+g(q) = Σᵢ Jᵢ(q)ᵀ · mᵢ · g⃗
+
+也就是说，把每个连杆的重量，通过该连杆的雅可比矩阵折算到各个关节上，再把它们叠加起来。关节转动时，雅可比、质心也都会变化，因此每 10 ms 都要重新计算一次。
+
+这就是为什么它要用到 URDF 里的 <inertial>：质量和质心直接决定 g(q) 的数值。
+
+③ 关节力矩 → 电机力矩（第 320 行）
+python
+
+tau = dirs[j] * g[i] * gains[j] * args.scale * ramp
+
+乘以 dir 是换到电机侧。依据是功率守恒：
+代码块
+
+τ_joint · dq = τ_motor · denc，而 dq = dir · denc
+⟹ τ_motor = dir · τ_joint
+
+dir = −1 的关节（你的 J1），补偿力矩的符号也要反过来。
+
+后面三个系数各有用途：
+
+    gains[j]：单个关节的模型修正，用来调整 J1 下坠或上飘
+    scale：全局系数
+    ramp：渐入系数，从 0 线性升到 1
+
+④ 位置字段反算（第 327 行）
+python
+
+q_ref = q_hold[i] if args.hold else q[i]
+p_des = dirs[j] * (q_ref - offs[j])
+
+MIT 帧的位置字段属于电机侧编码器角，不是关节角，所以要反算回去。所以 --hold 会锁存 q_hold；不加 --hold 时使用当前角 q[i]，此时 kp 不起作用，这正是“推哪停哪”的实现方式。
+MIT 帧 8 字节怎么打
+python
+
+pi = f2u(p, -pmax, pmax, 16)      # 位置 16 bit → ±12.5 rad
+vi = f2u(0.0, -vmax, vmax, 12)    # 速度 12 bit，恒为 0
+kpi = f2u(kp, 0, 500, 12)         # Kp  12 bit
+kdi = f2u(kd, 0, 5, 12)           # Kd  12 bit
+ti  = f2u(t, -tmax, tmax, 12)     # 力矩 12 bit → ±10 N·m
+
+这几个量程全部在启动时从电机读取（RID 21/22/23），不硬编码，这样以后在别处修改 PMAX 也不会错。
+控制循环（100 Hz）
+python
+
+while True:
+    q = read_q()                     # 6 次寄存器读，约 1.5 ms
+    if q is None:                    # 丢帧保护
+        fails += 1
+        if fails > 5: break          # 连续 5 次读不到 → 急停
+    g = pin.computeGeneralizedGravity(model, data, q)
+    for 每个关节:
+        tau = 限幅(dir·g·gain·scale·ramp)
+        send(mit_frame(p_des, 0, kp, kd, tau))
+    sleep(period - 已用时间)
+    
+    
+    ~/Desktop/ros2_gong/                    ← 目录
+├── start.sh                             一键启动脚本
+├── 文档                                 114 字节的文件（你建的笔记？）
+├── src/                                 源码
+│   ├── robotarm/                        主包：描述 + 配置 + 网格
+│   │   ├── urdf/
+│   │   │   └── robotarm.urdf            ← 刚加了 ros2_control 段
+│   │   ├── config/
+│   │   │   ├── joint_offsets.yaml       零点标定（dir + offset）
+│   │   │   ├── gravity_comp.yaml        重力补偿参数
+│   │   │   └── ros2_controllers.yaml    ← 今天新建
+│   │   ├── launch/
+│   │   │   ├── display.launch.py        纯显示
+│   │   │   └── ros2_control.launch.py   ← 今天新建
+│   │   ├── rviz/display.rviz
+│   │   └── meshes/                      7 块 STL，32.9 MB
+│   └── robotarm_bridge/                 CAN → /joint_states
+├── tools/                               7 个脚本
+├── build/  install/  log/               colcon 产物
+
+
+./start.sh  规划轨迹
+ros2 action send_goal /arm_controller/follow_joint_trajectory \
+  control_msgs/action/FollowJointTrajectory \
+  "{trajectory: {joint_names: [J0,J1,J2,J3,J4,J5], points: [{positions: [0.8,-0.6,0.5,-0.4,0.6,1.0], time_from_start: {sec: 3}}]}}"
+  
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash          # ← 关键，缺这一行
+ros2 launch robotarm display.launch.py规划轨迹动模型
+python3 tools/gravity_comp.py --send真出力：失重，推哪停哪
+python3 joint_servo.py --send+打开visr~/Desktop/ros2_gong/tools	python3 arm_viser.py --port 8080
+

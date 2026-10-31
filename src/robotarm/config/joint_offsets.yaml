@@ -1,0 +1,27 @@
+# 6 轴 robotarm 零点标定结果
+#   q_joint = dir * q_encoder + offset      (rad)
+#   由 tools/calibrate_offsets.py 生成，重新 launch 生效（--symlink-install 不需要 rebuild）
+
+offsets:
+  J0  : -0.065961
+  J1  : +0.514058
+  J2  : -2.803086
+  J3  : +1.051396
+  J4  : +2.047864
+  J5  : +1.456227
+
+directions:
+  J0  : +1
+  J1  : -1
+  J2  : +1
+  J3  : +1
+  J4  : +1
+  J5  : +1
+
+can_ids:
+  J0  : 1
+  J1  : 2
+  J2  : 3
+  J3  : 4
+  J4  : 5
+  J5  : 6
