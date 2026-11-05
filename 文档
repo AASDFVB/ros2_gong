@@ -21,6 +21,7 @@ cansend can0 002#FFFFFFFFFFFFFFFC
 cansend can0 003#FFFFFFFFFFFFFFFC
 cansend can0 004#FFFFFFFFFFFFFFFC
 cansend can0 005#FFFFFFFFFFFFFFFC
+cansend can0 006#FFFFFFFFFFFFFFFC
 python3 tools/live_feedback.py   是查看达妙反馈侦
 查看rviz接真机
 cd ~/Desktop/ros2_gong
@@ -138,7 +139,56 @@ ros2 action send_goal /arm_controller/follow_joint_trajectory \
 cd ~/Desktop/ros2_gong
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash          # ← 关键，缺这一行
+
+
+source /opt/ros/jazzy/setup.bash
+source ~/Desktop/ros2_gong/install/setup.bash
+
 ros2 launch robotarm display.launch.py规划轨迹动模型
 python3 tools/gravity_comp.py --send真出力：失重，推哪停哪
 python3 joint_servo.py --send+打开visr~/Desktop/ros2_gong/tools	python3 arm_viser.py --port 8080
 
+
+
+
+
+
+
+# ① 插上无线模块的 USB 端（现在没识别到）
+ls /dev/ttyACM0          # 插好后应该能看到
+
+# ② 起 ros2_control（新终端，保持开着）
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch robotarm ros2_control.launch.py rviz:=false
+
+# ③ 确认数据源
+ros2 topic hz /joint_states     # ~200 Hz
+
+# ④ 跑镜像（注意先 cd）
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash
+python3 tools/mirror_to_arm2.py --log
+
+# 直接 Ctrl-C。脚本会先发 M 0，固件 300 ms 后自动退回纯重力补偿
+四、验收数字
+代码块
+
+
+第N秒 收帧=1000/1000/1000/1000/1000/1000 ... UART收=700 遥测=50 UART丢=0 坏帧=0
+数	正常值	异常含义
+收帧	六项全 1000	某项 0 = 那个电机离线
+遥测	≈50	远低于 50 = 链路丢帧
+UART丢	0	非 0 = 串口接收溢出
+坏帧	0	非 0 = 校验失败
+五、常用参数
+bash
+
+
+python3 tools/mirror_to_arm2.py --rate 50          # 发送频率（默认 50）
+python3 tools/mirror_to_arm2.py --kp 5 --kd 1.5    # 位置刚度/阻尼（默认 3.0 / 1.0）
+python3 tools/mirror_to_arm2.py --stale-ms 500     # 数据多久算过期（默认 200）
+python3 tools/mirror_to_arm2.py --fmt text         # 退回文本帧（调试用）
+python3 tools/mirror_to_arm2.py --dry-run          # 只打印，不碰串口
+python3 tools/mirror_to_arm2.py --port /dev/ttyACM1  # 走 C 板 USB CDC（备用通道）

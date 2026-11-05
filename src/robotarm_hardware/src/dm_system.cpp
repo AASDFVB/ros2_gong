@@ -1,10 +1,15 @@
 #include "robotarm_hardware/dm_system.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/parsers/urdf.hpp>
 
 #include <fcntl.h>
 #include <linux/can.h>
@@ -141,6 +146,122 @@ bool DmSystemHardware::load_calibration(const std::string & path)
   }
 }
 
+// ---------------------------------------------------------------- 重力补偿
+bool DmSystemHardware::send_raw(int can_id, const uint8_t data[8])
+{
+  struct can_frame f;
+  std::memset(&f, 0, sizeof(f));
+  f.can_id = static_cast<canid_t>(can_id);
+  f.can_dlc = 8;
+  std::memcpy(f.data, data, 8);
+  return ::write(can_fd_, &f, sizeof(f)) == static_cast<ssize_t>(sizeof(f));
+}
+
+void DmSystemHardware::enable_motors()
+{
+  static const uint8_t k_clear[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB};
+  static const uint8_t k_enable[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
+  for (auto & j : joints_) {
+    send_raw(j.can_id, k_clear);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (auto & j : joints_) {
+    send_raw(j.can_id, k_enable);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // 清掉使能过程产生的回包，别让 read() 把它们当普通反馈
+  struct can_frame junk;
+  while (::read(can_fd_, &junk, sizeof(junk)) == sizeof(junk)) {}
+}
+
+void DmSystemHardware::disable_motors()
+{
+  static const uint8_t k_disable[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
+  // 先补几帧零力矩，再失能，避免带力矩直接断电造成抖动
+  for (int k = 0; k < 5; ++k) {
+    for (auto & j : joints_) {
+      uint8_t d[8];
+      const double p_des = j.dir * (j.state_pos - j.offset);
+      pack_mit(d, p_des, 0.0, 0.0, 0.0, 0.0, j.pmax, j.vmax, j.tmax);
+      send_raw(j.can_id, d);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  for (auto & j : joints_) {
+    send_raw(j.can_id, k_disable);
+  }
+}
+
+bool DmSystemHardware::load_gravity()
+{
+  const auto log = rclcpp::get_logger("DmSystemHardware");
+  std::string share;
+  try {
+    share = ament_index_cpp::get_package_share_directory("robotarm");
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(log, "定位 robotarm 包失败，重力补偿关闭: %s", e.what());
+    return false;
+  }
+  const std::string urdf_path = share + "/urdf/robotarm.urdf";
+  const std::string yaml_path = share + "/config/gravity_comp.yaml";
+
+  try {
+    pin_model_ = std::make_unique<pinocchio::Model>();
+    pinocchio::urdf::buildModel(urdf_path, *pin_model_);
+    pin_data_ = std::make_unique<pinocchio::Data>(*pin_model_);
+    pin_q_ = Eigen::VectorXd::Zero(pin_model_->nq);
+
+    q_idx_.assign(joints_.size(), -1);
+    v_idx_.assign(joints_.size(), -1);
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      const std::string & name = joints_[i].name;
+      if (!pin_model_->existJointName(name)) {
+        RCLCPP_ERROR(log, "URDF 里找不到关节 %s，重力补偿关闭", name.c_str());
+        return false;
+      }
+      const auto id = pin_model_->getJointId(name);
+      q_idx_[i] = pin_model_->joints[id].idx_q();
+      v_idx_[i] = pin_model_->joints[id].idx_v();
+    }
+
+    grav_gain_.assign(joints_.size(), 1.0);
+    const YAML::Node node = YAML::LoadFile(yaml_path);
+    if (node["common"]) {
+      grav_scale_ = node["common"]["scale"].as<double>(grav_scale_);
+      grav_limit_ = node["common"]["limit"].as<double>(grav_limit_);
+      grav_ramp_s_ = node["common"]["ramp"].as<double>(grav_ramp_s_);
+    }
+    if (node["gains"]) {
+      for (size_t i = 0; i < joints_.size(); ++i) {
+        const YAML::Node g = node["gains"][joints_[i].name];
+        if (g) {
+          grav_gain_[i] = g.as<double>();
+        }
+      }
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(log, "建重力模型失败，重力补偿关闭: %s", e.what());
+    return false;
+  }
+
+  RCLCPP_INFO(log, "重力补偿: nq=%d scale=%.2f limit=%.1fN·m ramp=%.1fs",
+    pin_model_->nq, grav_scale_, grav_limit_, grav_ramp_s_);
+  return true;
+}
+
+double DmSystemHardware::gravity_torque(size_t i) const
+{
+  double ramp = 1.0;
+  if (grav_ramp_started_ && grav_ramp_s_ > 1e-6) {
+    const double el = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - grav_t0_).count();
+    ramp = std::clamp(el / grav_ramp_s_, 0.0, 1.0);
+  }
+  const double tau =
+    joints_[i].dir * pin_data_->g[v_idx_[i]] * grav_gain_[i] * grav_scale_ * ramp;
+  return std::clamp(tau, -grav_limit_, grav_limit_);
+}
+
 hardware_interface::CallbackReturn DmSystemHardware::on_configure(
   const rclcpp_lifecycle::State &)
 {
@@ -158,6 +279,13 @@ hardware_interface::CallbackReturn DmSystemHardware::on_configure(
   RCLCPP_INFO(rclcpp::get_logger("DmSystemHardware"), "标定文件: %s", path.c_str());
   if (!load_calibration(path)) {
     return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // 重力模型失败不致命：退化成原来的零力矩行为，只是没有重力补偿
+  gravity_ok_ = load_gravity();
+  if (!gravity_ok_) {
+    RCLCPP_WARN(rclcpp::get_logger("DmSystemHardware"),
+      "重力补偿不可用，本次运行只做反馈读取（不出力）");
   }
 
   if (!open_can(can_interface_)) {
@@ -214,14 +342,25 @@ hardware_interface::CallbackReturn DmSystemHardware::on_activate(
   // 清掉配置阶段残留的寄存器回包，避免被 read() 当成反馈帧
   struct can_frame junk;
   while (::read(can_fd_, &junk, sizeof(junk)) == sizeof(junk)) {}
-  RCLCPP_INFO(rclcpp::get_logger("DmSystemHardware"), "已激活（2a：零力矩帧换反馈，不出力）");
+  // 使能电机，并用 4 秒把重力补偿渐入，避免一上电猛地一撑
+  enable_motors();
+  grav_t0_ = std::chrono::steady_clock::now();
+  grav_ramp_started_ = true;
+
+  RCLCPP_INFO(rclcpp::get_logger("DmSystemHardware"),
+    "已激活：重力补偿%s（渐入 %.1fs，单轴限幅 %.1fN·m）",
+    gravity_ok_ ? "开" : "关", grav_ramp_s_, grav_limit_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn DmSystemHardware::on_deactivate(
   const rclcpp_lifecycle::State &)
 {
-  RCLCPP_INFO(rclcpp::get_logger("DmSystemHardware"), "已停用");
+  grav_ramp_started_ = false;
+  if (can_fd_ >= 0) {
+    disable_motors();
+  }
+  RCLCPP_INFO(rclcpp::get_logger("DmSystemHardware"), "已停用（已失能）");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -353,12 +492,21 @@ hardware_interface::return_type DmSystemHardware::read(
 hardware_interface::return_type DmSystemHardware::write(
   const rclcpp::Time &, const rclcpp::Duration &)
 {
-  // 2a：发 kp=kd=t=0 的 MIT 帧，唯一目的让电机回一帧反馈。
-  // 电机未使能，即使使能了 kp/kd/t 全 0 也不会出力。
-  for (auto & j : joints_) {
+  // 先把当前关节角填进 Pinocchio 的 q，一次算完 g(q)
+  if (gravity_ok_) {
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      pin_q_[q_idx_[i]] = joints_[i].state_pos;
+    }
+    pinocchio::computeGeneralizedGravity(*pin_model_, *pin_data_, pin_q_);
+  }
+
+  // MIT 帧：kp/kd 保持 0（推哪停哪），t_ff 放重力补偿力矩。
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    auto & j = joints_[i];
     uint8_t d[8];
     const double p_des = j.dir * (j.state_pos - j.offset);  // 回到电机侧
-    pack_mit(d, p_des, 0.0, 0.0, 0.0, 0.0, j.pmax, j.vmax, j.tmax);
+    const double t_ff = gravity_ok_ ? gravity_torque(i) : 0.0;
+    pack_mit(d, p_des, 0.0, 0.0, 0.0, t_ff, j.pmax, j.vmax, j.tmax);
     struct can_frame f;
     std::memset(&f, 0, sizeof(f));
     f.can_id = static_cast<canid_t>(j.can_id);

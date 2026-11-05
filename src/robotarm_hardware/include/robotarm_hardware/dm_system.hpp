@@ -1,10 +1,17 @@
 #ifndef ROBOTARM_HARDWARE__DM_SYSTEM_HPP_
 #define ROBOTARM_HARDWARE__DM_SYSTEM_HPP_
 
+#include <array>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <Eigen/Core>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/model.hpp>
 
 #include "hardware_interface/system_interface.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
@@ -61,6 +68,13 @@ private:
   static float as_float(uint32_t v);
   bool load_calibration(const std::string & path);
 
+  // ---- 重力补偿（Pinocchio 关节空间 g(q)，作为 MIT 帧的 t_ff 下发）----
+  bool load_gravity();
+  bool send_raw(int can_id, const uint8_t data[8]);
+  void enable_motors();
+  void disable_motors();
+  double gravity_torque(size_t i) const;
+
   std::string can_interface_{"can0"};
   std::string calibration_file_;
   int can_fd_{-1};
@@ -68,6 +82,20 @@ private:
   std::unordered_map<int, size_t> mst_index_;
   uint64_t rx_frames_{0};
   uint64_t rx_miss_{0};
+
+  // 重力模型：从 robotarm 包的 robotarm.urdf 建，参数读 config/gravity_comp.yaml
+  bool gravity_ok_{false};
+  std::unique_ptr<pinocchio::Model> pin_model_;
+  std::unique_ptr<pinocchio::Data> pin_data_;
+  Eigen::VectorXd pin_q_;
+  std::vector<int> q_idx_;   // 每个关节在 q 向量里的下标（nq）
+  std::vector<int> v_idx_;   // 每个关节在 g 向量里的下标（nv）
+  std::vector<double> grav_gain_;
+  double grav_scale_{1.0};
+  double grav_limit_{6.0};
+  double grav_ramp_s_{4.0};
+  std::chrono::steady_clock::time_point grav_t0_{};
+  bool grav_ramp_started_{false};
 };
 
 }  // namespace robotarm_hardware
