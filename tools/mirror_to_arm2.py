@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import pathlib
 import struct
@@ -47,8 +48,10 @@ import time
 
 JOINTS = ("J0", "J1", "J2", "J3", "J4", "J5")
 
-# 与固件 app/app_config.h 的 APP_TELEOP_RANGE 保持一致
-LIMIT_RAD = 7.0
+# 与固件 app/app_config.h 的 APP_TELEOP_RANGE 保持一致：±180°。
+# 注意：臂1 的实测角偶尔会略微超过 π（贴在限位上），所以这边必须先夹住，
+# 否则整帧会被固件以 ERR P range 拒掉，六轴一起丢。
+LIMIT_RAD = math.pi
 # 与固件 APP_TELEOP_TIMEOUT_MS 对应：这边先停发，那边 300 ms 后自动放开保持
 DEFAULT_STALE_MS = 200.0
 DEFAULT_RATE = 100.0
@@ -118,11 +121,15 @@ class MirrorCore:
         qs = []
         for j in JOINTS:
             v = self._q[j]
-            if v > self.limit_rad:
-                v = self.limit_rad
+            # 夹到 limit 之内并留 2 mrad 余量：帧里是整数 mrad，四舍五入会把
+            # π(3.14159) 顶成 3142 mrad = 3.142，固件按 ±π 校验就会整帧拒收
+            # （实测表现就是 UART收 正常但 遥测=0、坏帧 狂涨）。
+            lim = self.limit_rad - 0.002
+            if v > lim:
+                v = lim
                 self.clamped += 1
-            elif v < -self.limit_rad:
-                v = -self.limit_rad
+            elif v < -lim:
+                v = -lim
                 self.clamped += 1
             qs.append(v)
         return self.formatter(qs)
@@ -141,8 +148,17 @@ def _usb_ids(port: str) -> tuple[str, str] | None:
         return None
 
 
-def find_port(prefer=("wireless", "board")) -> str | None:
-    """默认优先无线模块（2e3c:5740），其次 C 板 CDC，最后第一个 ttyACM*。"""
+def find_port() -> str | None:
+    """优先无线模块，其次 C 板 CDC，最后第一个 ttyACM*。
+
+    优先走 /dev/serial/by-id/：ttyACM 的编号会在重插后变（实测 ACM0 → ACM1），
+    脚本如果按编号打开，模块一重插就写进了已删除的节点，表现是「臂2 一个字节都收不到」。
+    by-id 路径跟着模块走，编号怎么变都指向它。
+    """
+    for pat in ("*SEEKFREE*", "*STMicroelectronics*", "*STM32*"):
+        for p in sorted(glob.glob("/dev/serial/by-id/" + pat)):
+            return p
+
     ports = sorted(glob.glob("/dev/ttyACM*"))
     if not ports:
         return None
@@ -162,6 +178,7 @@ class SerialSink:
         self.ser = None
         self.sent = 0
         self.failed = 0
+        self.consec_fail = 0
 
     def open(self) -> None:
         if self.dry_run:
@@ -199,10 +216,20 @@ class SerialSink:
         try:
             self.ser.write(frame)
             self.sent += 1
+            self.consec_fail = 0
         except Exception as exc:  # 串口断开/写超时：计数，不中断循环
             self.failed += 1
+            self.consec_fail += 1
             if self.failed in (1, 50, 500):
                 print(f"⚠️  写串口失败（第 {self.failed} 次）: {exc}")
+            if self.consec_fail >= 30:
+                raise SystemExit(
+                    "\n❌ 连续 30 次写串口超时：PC → 机械臂 方向不通。\n"
+                    "   机器人 → PC 方向通常是好的（能看到第N秒 汇总行），\n"
+                    "   说明无线模块只通了一半，按顺序查：\n"
+                    "     1) 机器人侧「无线转串」小板指示灯是否亮（它靠 J30 第4脚 5V 供电）\n"
+                    "     2) 给机器人侧模块断电重上电 / 重插 USB 端\n"
+                    "     3) 改用有线：C 板 Micro-USB + --port /dev/ttyACM0\n")
 
         if self.echo:
             self._drain_rx()

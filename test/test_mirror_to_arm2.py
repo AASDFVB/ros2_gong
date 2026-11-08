@@ -110,10 +110,17 @@ def test_core() -> None:
     # 越界夹紧（固件对整帧做 ±APP_TELEOP_RANGE 校验，越界会导致整帧被拒）
     clamp = MirrorCore(stale_ms=200.0, limit_rad=7.0, formatter=format_cmd)
     clamp.update(list(JOINTS), [99.0, -99.0, 0, 0, 0, 0], now=t)
-    eq("越界值被夹到 ±7 rad",
+    eq("越界值被夹到 ±7 rad 内（留 2 mrad 余量给 mrad 取整）",
        clamp.build_frame(now=t),
-       b"P 7.0000 -7.0000 0.0000 0.0000 0.0000 0.0000\n")
+       b"P 6.9980 -6.9980 0.0000 0.0000 0.0000 0.0000\n")
     eq("夹紧次数被记下来", clamp.clamped, 2)
+
+    # 默认限位是 ±π（与固件 APP_TELEOP_RANGE = ±180° 一致）
+    dflt_clamp = MirrorCore(stale_ms=200.0, formatter=format_cmd)
+    dflt_clamp.update(list(JOINTS), [4.0, -4.0, 3.2, -3.2, 0, 0], now=t)
+    eq("默认限位 ±π 夹紧，且留 2 mrad 余量（否则取整后 3142mrad 会被固件拒）",
+       dflt_clamp.build_frame(now=t),
+       b"P 3.1396 -3.1396 3.1396 -3.1396 0.0000 0.0000\n")
 
     # 默认 formatter 是二进制：帧长 14、首字节 0xAA
     dflt = MirrorCore(stale_ms=200.0)
