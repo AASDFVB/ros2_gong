@@ -192,3 +192,252 @@ python3 tools/mirror_to_arm2.py --stale-ms 500     # 数据多久算过期（默
 python3 tools/mirror_to_arm2.py --fmt text         # 退回文本帧（调试用）
 python3 tools/mirror_to_arm2.py --dry-run          # 只打印，不碰串口
 python3 tools/mirror_to_arm2.py --port /dev/ttyACM1  # 走 C 板 USB CDC（备用通道）
+
+
+
+两个项目的完整命令
+一、igh6_jxb — 机械臂 2 固件
+bash
+
+
+cd ~/Desktop/igh6_jxb
+编译 / 烧录
+bash
+
+
+# 只编译
+make GCC_PATH=$HOME/.local/opt/xpack-arm-none-eabi-gcc-15.2.1-1.1/bin -j
+
+# 编译 + 烧录（推荐，一条命令）
+bash tools/flash.sh
+
+# 先全片擦除再烧（固件跑飞时用）
+bash tools/flash.sh --erase
+看日志
+bash
+
+
+cat /dev/ttyACM0                    # 无线模块
+cat /dev/ttyACM1                    # C 板 USB CDC（有线，更稳）
+# 注意：镜像脚本在跑时别开 cat，会抢数据
+重力模型（改标定后必须做）
+bash
+
+
+python3 tools/gen_gravity_model.py
+# → app/gravity_model.h  +  test/gravity_vectors.h
+
+# 主机侧验证
+cc app/gravity.c test/test_gravity.c -Iapp -lm -o /tmp/tg && /tmp/tg
+cc app/dm_motor.c test/test_dm_motor.c -lm -o /tmp/tdm && /tmp/tdm
+python3 test/xcheck.py
+调试器直读（绕开串口）
+bash
+
+
+set -a; OC=~/.local/opt/xpack-openocd-0.12.0-7/bin/openocd; set +a
+
+# 目标电压（判断板子有没有电）
+$OC -f interface/stlink.cfg -f target/stm32f4x.cfg -c "init" -c "shutdown"
+
+# 读 J0 编码器（g_motors[0].last.pos）
+$OC -f interface/stlink.cfg -f target/stm32f4x.cfg \
+  -c "init" -c "halt" -c "wait_halt 1000" -c "mdw 0x20000918 1" -c "resume" -c "shutdown"
+二、ros2_gong — 机械臂 1 + 镜像上位机
+bash
+
+
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash
+编译
+bash
+
+
+colcon build --symlink-install                                    # 全部
+colcon build --packages-select robotarm_hardware --symlink-install  # 只改了插件
+CAN（每次重启 / 重插 PCAN 都要做）
+bash
+
+
+sudo modprobe peak_usb
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+ip -br link show can0                # 必须显示 UP
+起 ros2_control（终端 A，保持开着）
+bash
+
+
+source install/setup.bash
+ros2 launch robotarm ros2_control.launch.py rviz:=false
+# 或一键：./start.sh --no-rviz
+正常应看到：
+
+代码块
+
+
+重力补偿: nq=6 scale=1.00 limit=6.0N·m ramp=4.0s
+已激活：重力补偿开（渐入 4.0s，单轴限幅 6.0N·m）
+验证数据源
+bash
+
+
+ros2 topic hz /joint_states                                    # ~200 Hz
+ros2 topic echo /joint_states --once --field position           # 六轴角度
+跑镜像（终端 B）
+bash
+
+
+python3 tools/mirror_to_arm2.py --log                # 自动找无线模块（by-id）
+python3 tools/mirror_to_arm2.py --log --port /dev/ttyACM0   # 走 C 板 USB CDC
+python3 tools/mirror_to_arm2.py --dry-run            # 只打印不发
+python3 tools/mirror_to_arm2.py --rate 40 --kp 5 --kd 1.5   # 降频/调刚度
+测试
+bash
+
+
+python3 test/test_mirror_to_arm2.py      # 28 项
+其它工具（会独占 can0，必须先停 ros2_control）
+bash
+
+
+python3 tools/gravity_comp.py            # dry-run 看 g(q)
+python3 tools/gravity_comp.py --send     # 真出力
+python3 tools/joint_servo.py --send
+python3 tools/live_angles.py
+python3 tools/live_feedback.py
+python3 tools/calibrate_offsets.py
+三、从零到镜像的完整顺序
+bash
+
+
+# ① 烧机械臂2 固件（改动过固件才需要）
+cd ~/Desktop/igh6_jxb && bash tools/flash.sh
+
+# ② CAN
+sudo modprobe peak_usb
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+ip -br link show can0
+
+# ③ 机械臂1 的 ros2_control（终端 A）
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash && source install/setup.bash
+ros2 launch robotarm ros2_control.launch.py rviz:=false
+
+# ④ 确认数据源（终端 B）
+ros2 topic hz /joint_states        # ~200 Hz
+
+# ⑤ 摆位：两臂摆成接近的姿态
+# ⑥ 镜像（终端 C）
+python3 tools/mirror_to_arm2.py --log
+四、改完参数后怎么生效
+改了什么	生效方式
+app/app_config.h、app/gcomp_params.h、home_params.h	重新烧录 bash tools/flash.sh
+host/joint_offsets.yaml（零点）	先 gen_gravity_model.py 再 重新烧录
+app/gravity_model.h 被重新生成	重新烧录
+src/robotarm_hardware/*.cpp/.hpp	colcon build + 重启 ros2_control
+src/robotarm/config/gravity_comp.yaml（gain）	只重启 ros2_control，不用编译
+tools/mirror_to_arm2.py	直接重跑，无需编译
+src/robotarm/urdf/*.urdf	colcon build（symlink，通常重启即可）
+五、排障速查
+现象	真实原因	处理
+motor 1 无应答（检查 ID/供电/接线）	先查 can0 是不是 DOWN；再查臂1 电源/线	ip link set can0 up
+ros2_control_node exit code -6	硬件 configure 失败被 resource_manager 抛出，不是代码崩	修硬件后重启
+卡在“等 /joint_states 的第一帧”	ros2_control 没跑	起 ③
+Permission denied: /dev/ttyACM0	终端没 dialout 组	newgrp dialout 或 udev 规则
+打开串口后 Write timeout	PC→臂2 方向不通（模块问题）	换有线 --port
+遥测 远低于 50、坏帧 涨	链路丢字节 / 整帧被拒	查模块；确认脚本已夹到 ±π 内
+遥测超时 300 ms 偶发	/joint_states 抖动（正常保护）	频繁则调大 --stale-ms
+收帧 某项为 0	那台电机离线（重力补偿会整体关闭）	查该轴 24V / CAN 段
+J0 绕整圈	2π 分支问题	固件已用 wrap_pi 修
+J0 移动后比例不对	电机量程/减速比差异	待加逐轴 scale
+六、两边的参数在哪
+参数	文件	生效
+重力补偿 gain/scale/limit/ramp（臂2）	igh6_jxb/app/gcomp_params.h	烧录
+重力补偿 gain（臂1）	ros2_gong/src/robotarm/config/gravity_comp.yaml	重启节点
+遥操作限速 / 超时 / 限位（臂2）	igh6_jxb/app/app_config.h	烧录
+软限位刚度（臂1）	dm_system.cpp 的 kLimitRad/kStiffness/kMaxNm	编译+重启
+零点 dir/offset	igh6_jxb/host/joint_offsets.yaml	生成+烧录
+日志音量（臂2）	app_config.h 的 APP_LOG_LEVEL	烧录
+镜像频率/格式/端口	命令行参数	立即
+
+
+
+
+
+新起
+
+systemctl status can0.service --no-pager | head -4
+systemctl --user status robotarm.service --no-pager | head -5
+journalctl --user -u mirror.service -n 5 --no-pager
+
+
+关闭自启动
+
+① 用户级服务（robotarm、mirror）已执行完成
+bash
+
+systemctl --user disable --now robotarm.service mirror.service
+
+② can0（需要 sudo）
+bash
+
+sudo systemctl disable --now can0.service
+
+结果：开机后三个服务都不会自动启动；需要手动启动命令。
+开启自启动
+
+① 用户级服务
+bash
+
+systemctl --user enable --now robotarm.service mirror.service
+
+② can0
+bash
+
+sudo systemctl enable --now can0.service
+
+
+
+
+区别说明
+命令	作用
+enable	设置开机自启，不立即启动
+disable	取消开机自启，不影响当前运行状态
+--now	同时立即启动或停止
+enable --now	开机自启 + 现在就启动
+disable --now	取消自启 + 现在就停止
+只操作单个服务
+bash
+
+# 只关 robotarm，保留 mirror
+systemctl --user disable --now robotarm.service
+
+# 只开 can0
+sudo systemctl enable --now can0.service
+
+常用查询
+bash
+
+# 看自启状态（enabled / disabled）
+systemctl --user is-enabled robotarm.service mirror.service
+systemctl is-enabled can0.service
+
+# 看运行状态（active / inactive / failed）
+systemctl --user is-active robotarm.service mirror.service
+systemctl is-active can0.service
+
+# 一次看全部
+systemctl --user status robotarm.service mirror.service --no-pager
+systemctl status can0.service --no-pager
+
+手动启动（不开自启时）
+
+# 或直接跑（能看实时输出）
+sudo systemctl start can0.service
+ip -br link show can0        # 应该是 UP
+cd ~/Desktop/ros2_gong
+source /opt/ros/jazzy/setup.bash && source install/setup.bash
+ros2 launch robotarm ros2_control.launch.py rviz:=false
+
+
