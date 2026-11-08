@@ -239,6 +239,28 @@ bool DmSystemHardware::load_gravity()
         }
       }
     }
+    // 负角度侧（q < 0）单独一套系数；没配的轴沿用 grav_gain_
+    grav_gain_neg_ = grav_gain_;
+    if (node["gains_neg"]) {
+      for (size_t i = 0; i < joints_.size(); ++i) {
+        const YAML::Node g = node["gains_neg"][joints_[i].name];
+        if (g) {
+          grav_gain_neg_[i] = g.as<double>();
+        }
+      }
+    }
+
+    // 逐轴角度修正（度 → rad）：补偿质心/零点偏差，等价于用 q+phase 评估重力模型
+    grav_phase_.assign(joints_.size(), 0.0);
+    if (node["phase_deg"]) {
+      for (size_t i = 0; i < joints_.size(); ++i) {
+        const YAML::Node ph = node["phase_deg"][joints_[i].name];
+        if (ph) {
+          grav_phase_[i] = ph.as<double>() * M_PI / 180.0;
+        }
+      }
+    }
+
   } catch (const std::exception & e) {
     RCLCPP_ERROR(log, "建重力模型失败，重力补偿关闭: %s", e.what());
     return false;
@@ -249,6 +271,26 @@ bool DmSystemHardware::load_gravity()
   return true;
 }
 
+double DmSystemHardware::limit_torque(size_t i) const
+{
+  // 与 URDF 声明一致：|q| > π 就开始顶回去。刚度选得比较温和，
+  // 目的是给出"到这里了"的手感，而不是把手臂弹开。
+  static constexpr double kLimitRad = 3.141592653589793;
+  static constexpr double kDeadband = 0.02;   // rad ≈1.1°，标定贴着限位时不误触发
+  static constexpr double kStiffness = 8.0;   // N·m/rad
+  static constexpr double kMaxNm = 3.0;       // 软限位最多顶 3 N·m
+
+  const double q = joints_[i].state_pos;
+  const double over = std::fabs(q) - kLimitRad - kDeadband;
+  if (over <= 0.0) {
+    return 0.0;
+  }
+  const double push = std::min(over * kStiffness, kMaxNm);
+  // q 超过正限位就要往负方向推，反之亦然；最后映射到电机侧
+  const double tau_joint = (q > 0.0) ? -push : push;
+  return joints_[i].dir * tau_joint;
+}
+
 double DmSystemHardware::gravity_torque(size_t i) const
 {
   double ramp = 1.0;
@@ -257,8 +299,14 @@ double DmSystemHardware::gravity_torque(size_t i) const
       std::chrono::steady_clock::now() - grav_t0_).count();
     ramp = std::clamp(el / grav_ramp_s_, 0.0, 1.0);
   }
+  // q >= 0 用 grav_gain_，q < 0 用 grav_gain_neg_；零点附近线性过渡，避免力矩跳变
+  static constexpr double kBlendRad = 0.10;   // ±5.7° 过渡带
+  const double q = joints_[i].state_pos;
+  const double w = std::clamp((q + kBlendRad) / (2.0 * kBlendRad), 0.0, 1.0);
+  const double gain = grav_gain_neg_[i] * (1.0 - w) + grav_gain_[i] * w;
+
   const double tau =
-    joints_[i].dir * pin_data_->g[v_idx_[i]] * grav_gain_[i] * grav_scale_ * ramp;
+    joints_[i].dir * pin_data_->g[v_idx_[i]] * gain * grav_scale_ * ramp;
   return std::clamp(tau, -grav_limit_, grav_limit_);
 }
 
@@ -368,10 +416,12 @@ hardware_interface::CallbackReturn DmSystemHardware::on_deactivate(
 std::vector<hardware_interface::StateInterface> DmSystemHardware::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> si;
-  si.reserve(joints_.size() * 2);
+  si.reserve(joints_.size() * 3);
   for (auto & j : joints_) {
     si.emplace_back(j.name, hardware_interface::HW_IF_POSITION, &j.state_pos);
     si.emplace_back(j.name, hardware_interface::HW_IF_VELOCITY, &j.state_vel);
+    // effort = 电机反馈的实测力矩（已乘 dir），用来对拍重力模型/调 gain
+    si.emplace_back(j.name, hardware_interface::HW_IF_EFFORT, &j.state_eff);
   }
   return si;
 }
@@ -495,9 +545,27 @@ hardware_interface::return_type DmSystemHardware::write(
   // 先把当前关节角填进 Pinocchio 的 q，一次算完 g(q)
   if (gravity_ok_) {
     for (size_t i = 0; i < joints_.size(); ++i) {
-      pin_q_[q_idx_[i]] = joints_[i].state_pos;
+      // 加 phase：模型用的角度可以偏离实测角，用来补偿质心/零点偏差
+      pin_q_[q_idx_[i]] = joints_[i].state_pos + grav_phase_[i];
     }
     pinocchio::computeGeneralizedGravity(*pin_model_, *pin_data_, pin_q_);
+  }
+
+  // 有轴超 ±180° 就节流告警（1 Hz），方便知道是撞限位了
+  {
+    bool over = false;
+    for (auto & j : joints_) {
+      if (std::fabs(j.state_pos) > 3.141592653589793 + 0.02) {
+        over = true;
+        break;
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (over && std::chrono::duration<double>(now - limit_warn_t0_).count() > 1.0) {
+      limit_warn_t0_ = now;
+      RCLCPP_WARN(rclcpp::get_logger("DmSystemHardware"),
+        "有轴超出 ±180° 软限位，正在施加回正力矩");
+    }
   }
 
   // MIT 帧：kp/kd 保持 0（推哪停哪），t_ff 放重力补偿力矩。
@@ -505,7 +573,7 @@ hardware_interface::return_type DmSystemHardware::write(
     auto & j = joints_[i];
     uint8_t d[8];
     const double p_des = j.dir * (j.state_pos - j.offset);  // 回到电机侧
-    const double t_ff = gravity_ok_ ? gravity_torque(i) : 0.0;
+    const double t_ff = (gravity_ok_ ? gravity_torque(i) : 0.0) + limit_torque(i);
     pack_mit(d, p_des, 0.0, 0.0, 0.0, t_ff, j.pmax, j.vmax, j.tmax);
     struct can_frame f;
     std::memset(&f, 0, sizeof(f));

@@ -12,7 +12,7 @@
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, RegisterEventHandler
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler, Shutdown
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
@@ -42,6 +42,9 @@ def generate_launch_description():
         executable='ros2_control_node',
         output='screen',
         parameters=[{'robot_description': robot_description}, ctrl_yaml],
+        # 硬件 configure 失败会让它 abort；不加 on_exit 的话 launch 会一直挂着，
+        # systemd 看着是 active 实际什么都没跑。这里让它死就整个 launch 退出。
+        on_exit=Shutdown(),
     )
 
     jsb_spawner = Node(

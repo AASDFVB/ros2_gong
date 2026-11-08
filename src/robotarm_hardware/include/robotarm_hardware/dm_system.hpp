@@ -74,6 +74,8 @@ private:
   void enable_motors();
   void disable_motors();
   double gravity_torque(size_t i) const;
+  // ±180° 软限位：超出后叠加一个回正弹簧力矩，让手推到这里"推不动"
+  double limit_torque(size_t i) const;
 
   std::string can_interface_{"can0"};
   std::string calibration_file_;
@@ -90,12 +92,15 @@ private:
   Eigen::VectorXd pin_q_;
   std::vector<int> q_idx_;   // 每个关节在 q 向量里的下标（nq）
   std::vector<int> v_idx_;   // 每个关节在 g 向量里的下标（nv）
-  std::vector<double> grav_gain_;
+  std::vector<double> grav_gain_;      // q >= 0 用的系数
+  std::vector<double> grav_gain_neg_;  // q < 0 用的系数（没配就沿用 grav_gain_）
+  std::vector<double> grav_phase_;     // 重力模型的角度修正（rad），补偿质心/零点偏差
   double grav_scale_{1.0};
   double grav_limit_{6.0};
   double grav_ramp_s_{4.0};
   std::chrono::steady_clock::time_point grav_t0_{};
   bool grav_ramp_started_{false};
+  std::chrono::steady_clock::time_point limit_warn_t0_{};
 };
 
 }  // namespace robotarm_hardware
